@@ -1,0 +1,219 @@
+#!/usr/bin/python3
+# Calculates volume of the convex hull of the input.
+
+# Inputs:
+#   Fields - List of fields in the input data; must include x,y; optional: z
+#   Data (list of points) should be input on STDIN
+
+import sys
+import numpy as np
+import argparse  # Can use getopts alternatively
+from scipy.spatial import ConvexHull
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import matplotlib.cm as cm
+import warnings
+from scipy.spatial.transform import Rotation as R
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('task', metavar='T', type=str, nargs=1,
+                        help='What do you want? (points | volume | area)',
+                        choices=['points', 'volume', 'area'])
+    parser.add_argument('-f', "--fields", type=str, default='x,y,z,id',
+                        help='list of fields in the input data')
+    parser.add_argument('-v', "--verbose", action="store_true",
+                        help="Print more output")
+    parser.add_argument('-o', "--output-stream", action="store_true",
+                        help="Output volume as a stream")
+    parser.add_argument('-s', "--show", action="store_true",
+                        help="Plot the resulting convex hull")
+    parser.add_argument('-a', "--append", action="store_true",
+                        help="Append the volume to the input stream")
+    args = parser.parse_args()
+
+    fields = np.array(args.fields.split(','))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        DATA = np.genfromtxt(sys.stdin.readlines(), delimiter=',')
+
+    nDims = ((fields == 'x') + (fields == 'y') + (fields == 'z')).sum()
+    if (nDims < 2):
+        sys.stderr.write("Not enough dimension fields provided")
+
+    # If insufficient data is provided, give 0 volume or no hull
+    if DATA.size == 0 or DATA.shape[0] < 3 or len(DATA.shape) == 1:
+        if args.verbose:
+            sys.stderr.write("Insufficient data points provided\n")
+        if args.task[0] == 'volume':
+            print("0")
+        elif args.task[0] == 'points':
+            sys.stdout.write("0")
+            print (nDims-1)*",0"
+        sys.exit(0)
+
+    if (fields == 'id').sum() > 0:
+        ids = DATA[:, fields == 'id']
+    else:
+        ids = np.zeros([DATA.shape[0], 1], dtype=np.uint8)
+
+    points = DATA[:, (fields == 'x') | (fields == 'y') | (fields == 'z')]
+
+    has_vex = False
+    vectors=[]
+    if (fields == 'vx').sum() > 0 and (fields=='vy').sum() > 0 and (fields=='vz').sum() > 0:
+        has_vex = True
+        vectors = DATA[:, (fields == 'vx') | (fields == 'vy') | (fields == 'vz')]
+        #vectors = np.unique(allvecs, axis=0)
+
+    volume = 0
+    uIDs = np.unique(ids)
+    pts = np.empty((1, nDims))
+    fig = plt.figure()
+    if nDims == 2:
+        ax = fig.add_subplot(111)
+    else:
+        ax = fig.add_subplot(111,projection="3d")
+    # colors = cm.rainbow(np.linspace(0, 1, len(uIDs)))
+    # colors2 = cm.rainbow(np.linspace(1, 0, len(uIDs)))
+
+    vols= np.zeros((DATA.shape[0],1),dtype='float64') + volume
+    OUT = np.append(DATA,vols,axis=1)
+
+    finalLocation=DATA.shape[1]
+
+    for i, v in enumerate(uIDs):
+        try:
+            id_points = points[ids[:, 0] == v, :]
+            if has_vex:
+                id_vectors = np.unique(vectors[ids[:, 0] == v, :],axis=0)
+            if id_points.shape[0] < 3:
+                continue
+            # When 3d data is provided but planar, convex hull cannot be calculated
+            if nDims == 3:
+                viable = np.array([True, True, True])
+            else:
+                viable = np.array([True,True])
+            if nDims == 3:
+                planar = np.array([False, False, False])
+            else:
+                planar = np.array([False,False])
+            if (id_points[:, 0].max() - id_points[:, 0].min() == 0):
+                if args.verbose:
+                    sys.stderr.write("Planar in the X dimension\n")
+                viable[0] = False
+                planar[0] = True
+                continue
+            if (id_points[:, 1].max() - id_points[:, 1].min() == 0):
+                if args.verbose:
+                    sys.stderr.write("Planar in the Y dimension\n")
+                viable[1] = False
+                planar[1] = True
+                continue
+            if (nDims == 3):
+                if (id_points[:, 2].max() - id_points[:, 2].min() == 0):
+                    if args.verbose:
+                        sys.stderr.write("Planar in the Z dimension\n")
+                    viable[2] = False
+                    planar[2] = True
+                    continue
+            pAxes = id_points[:, planar]
+            id_points = id_points[:, viable]
+            rot_points = id_points
+            if id_points.shape[0] <= 3:
+                if args.verbose:
+                    sys.stderr.write("Too few points in this voxel\n")
+                continue
+            PTS=[]
+            if args.task[0] == 'area' and has_vex:
+                #sys.stderr.write("Rotating shit\n")
+                # there should only be one vector
+                vecA = id_vectors[0,:]
+                vecB = [0,0,1]
+                # compute quaternion between a and b.
+                # https://stackoverflow.com/questions/1171849/finding-quaternion-representing-the-rotation-from-one-vector-to-another
+                quat_xyz = np.cross(vecA,vecB)
+                quat_w = np.sqrt(sum(i**2 for i in vecA)+sum(i**2 for i in vecB))+np.dot(vecA,vecB)
+                # Compute rotation matrix from quaternion
+                rmat = R.from_quat([quat_xyz[0],quat_xyz[1],quat_xyz[2],quat_w])
+                # Rotate points by R.
+                rot_points = rmat.apply(id_points)
+                # print(rot_points)
+                PTS = rot_points[:,0:2]
+                # hull = ConvexHull(rot_points[:,0:2])
+            elif args.task[0] == 'area':
+                #sys.stderr.write("Ignoring z axis\n")
+                rot_points=id_points
+                PTS=id_points[:,0:2]
+                # hull = ConvexHull(id_points[:,0:2])
+                ### hull = ConvexHull(rot_points)
+            else:
+                PTS=id_points
+                # hull = ConvexHull(id_points)
+            hull=0
+            # print(PTS)
+            try:
+                hull = ConvexHull(PTS)
+                ID_Vol=hull.volume
+            except:
+                if args.verbose:
+                    sys.stderr.write("Something went wrong in ConvexHull\n")
+                ID_Vol = 0
+            # id_points = points[ids[:, 0] == v, :]
+            points[ids[:, 0] == v, :]
+            # if args.show:
+            #     if (id_points.shape[1] == 2):
+            #         ax.scatter(points[:, 0], points[:, 1])
+            #         vx = np.append(id_points[hull.vertices, 0], id_points[hull.vertices[0], 0])
+            #         vy = np.append(id_points[hull.vertices, 1], id_points[hull.vertices[0], 1])
+            #         ax.plot(vx, vy, 'r--', lw=2)
+            #         # ax.plot(points[hull.vertices[0], 0], points[hull.vertices[0], 1], 'ro')
+            #     else:
+            #         ax.scatter(id_points[:, 0], id_points[:, 1], id_points[:, 2], c=colors[i,0:3])
+            #         tupleList = zip(id_points[:, 0], id_points[:, 1], id_points[:, 2])
+            #         ax.scatter(rot_points[:, 0], rot_points[:, 1], rot_points[:, 2], c=colors2[i,0:3])
+            #         if args.task[0] == "area":
+            #             vx = np.append(rot_points[hull.vertices, 0], rot_points[hull.vertices[0], 0])
+            #             vy = np.append(rot_points[hull.vertices, 1], rot_points[hull.vertices[0], 1])
+            #             ax.plot(vx, vy, 'r--', lw=2)
+            #         ltl = list(tupleList)
+            #         poly3d = [[ltl[hull.simplices[ix][iy]] for iy in range(len(hull.simplices[0]))] for ix in range(len(hull.simplices))]
+            #         collection = Poly3DCollection(poly3d, linewidths=1, alpha=0.2)
+            #         face_color = colors[i, 0:3]
+            #         collection.set_facecolor(face_color)
+            #         ax.add_collection3d(collection)
+            #         # Hide grid lines
+            #         ax.grid(False)
+            #         # if has_vex:
+            #         #     origin = [np.mean(id_points[:,0]),np.mean(id_points[:,1]),np.mean(id_points[:,2])]
+            #         #     #print(id_vectors)
+            #         #     ax.quiver([origin[0]],[origin[1]],[origin[2]], id_vectors[:,0], id_vectors[:,1], id_vectors[:,2],length=0.2)
+            volume = volume + ID_Vol
+            # print(points[hull.vertices])
+            id_points = points[ids[:, 0] == v, :]
+            points[ids[:, 0] == v, :]
+            OUT[ids[:,0] == v, finalLocation] = ID_Vol
+            if (not hull == 0):
+                pts = np.append(pts, points[hull.vertices], axis=0)  # this doesn't work??
+            # else:
+                # sys.stderr.write("Fuck you")
+        except Exception as e:
+            sys.stderr.write("Error: %s\n" % str(e))
+            # sys.stderr.write("Error found; likely a planar voxel\n")
+            exit()
+    # np.savetxt(sys.stderr, OUT, delimiter=',')
+    # sys.stderr.write(args.task[0])
+    # sys.stderr.write(args.append)
+    
+    if args.task[0] == 'volume' or args.task[0] == 'area':
+        if args.append:
+            np.savetxt(sys.stdout.buffer, OUT, delimiter=',', fmt='%.4f')
+        else:
+            # sys.stderr.write("PRINTING VOLUME ONLY")
+            print(volume)
+    elif args.task[0] == 'points':
+        np.savetxt(sys.stdout, pts, delimiter=',')
+    if args.show:
+        plt.show()

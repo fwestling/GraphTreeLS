@@ -1,0 +1,164 @@
+#!/bin/bash
+
+source $(type -p comma-application-util)
+
+function say() { echo "$scriptname: $@" >&2; }
+
+function die() {
+    say "$@"
+    exit 1
+}
+
+function bye() {
+    say "$@"
+    exit 0
+}
+
+function show() {
+    say "$1"
+    tr ' ' '\n' <<<${@:2} |
+        comma_path_value_line_split |
+        comma_path_value_from_var |
+        sed 's/^/  /g' \
+            >&2
+}
+
+function info_options() {
+    cat <<EOF
+--help; output instructions for using this program and exit.
+--operations; output the allowed operations to standard output and exit.
+--input-fields; output required field names (based on operation) to stdout and exit.
+EOF
+}
+
+function run_options() {
+    cat <<EOF
+--binary,-b=[<format>]; binary format of input fields.
+--debug,-d; output debugging information.
+--dry-run; do nothing, only output the commands to be executed.
+--fields,-f=<fields>; default=x,y,z,id; point dimenstions with id. Use csv-paste line-number or csv-blocks index.
+--radius,-r=<metres>; radius to look for ground points, e.g. for typical outdoor point cloud 5 metres may be a good setting.
+--up=<dimension>; default=+z; direction (+/-) and dimension (x/y/z) of the 'up' direction.
+EOF
+}
+
+function operations() {
+    cat <<EOF
+extract; extract ground points.
+append; for each point, append the corresponding ground point.
+height; append height of each point relevant to the ground.
+EOF
+}
+
+function description() { {
+    info_options
+    run_options
+} | sort; }
+
+function bash_completion() { description | sed 's/=.*//g' | sed 's/;.*//g' | sed 's/,/\n/g'; }
+
+function usage() {
+    local -r __spaces__=$(sed "s/./ /g" <<<$scriptname)
+    cat >&2 <<EOF
+
+Perform varius operations regarding ground extraction from the given point cloud.
+
+Usage:
+    $scriptname [ [ extract | height | append ] --radius=<meters> [ --fields=<csv> [ --binary=<csv> ] ] [ --debug ] < <points-cloud.csv> > <points-cloud-output.csv>
+    $__spaces__ | --help | --input-fields | --operations ]
+
+Operations:
+$(operations | sed 's/^/    /')
+
+Options:
+$(description | sed 's/^/    /')
+
+Example:
+    cat point-cloud.bin | $scriptname extract --fields=id,x,y,z --binary=ui,3d --radius=5 > point-cloud-ground.bin
+
+    cat point-cloud.csv | $scriptname height --fields=id,x,y,z --radius=8 > point-cloud-with-height.bin
+
+EOF
+    exit 0
+}
+
+## @page handle_info_options handle_info_options
+# @brief handle the options that just output information and exit.
+function handle_info_options() {
+    eval $(info_options | comma-options-to-name-value $@ | comma_path_value_mangle | sed 's/^/local -r options_/')
+    [[ -n "$options_operations" ]] && {
+        operations
+        exit 0
+    }
+    [[ -n "$options_input_fields" ]] && {
+        echo "x,y,z,id,block"
+        exit 0
+    }
+}
+
+function append_operation() {
+    echo "points-calc nearest-$options_extremum --full --fields=$options_extremum_fields --radius=$options_radius $options_binary_args $options_verbose"
+}
+
+function extract_operation() {
+    echo "points-calc nearest-$options_extremum --extremums --fields=$options_extremum_fields --radius=$options_radius $options_binary_args $options_verbose"
+}
+
+function height_operation() {
+    local shuffle_binary_args calc_binary_args fields_axis
+    [[ -z $options_binary ]] || {
+        calc_binary_args="$options_binary_args,$options_binary"
+        shuffle_binary_args="$calc_binary_args,d"
+    }
+
+    fields_axis=$(csv-fields clear --except=$options_axis <<<$options_fields)
+    fields_axis=$(csv-fields rename --fields=$options_axis --to=first/$options_axis <<<$fields_axis),$(csv-fields rename --fields=$options_axis --to=second/$options_axis <<<$fields_axis)
+
+    cat <<EOF
+$(append_operation) \\
+    | points-calc distance --fields=$fields_axis $calc_binary_args \\
+    | csv-shuffle --fields=$options_fields,$(csv-fields clear <<<$options_fields),height --output=$options_fields,height $shuffle_binary_args
+EOF
+}
+
+function check_and_amend_options() {
+    [[ '+' = ${options_up:0:1} ]] && options_extremum='min' || options_extremum='max'
+    options_axis=${options_up:1:1}
+    options_extremum_fields=$(csv-fields rename --fields=$options_axis --to=scalar <<<$options_fields)
+
+    [[ -z $options_binary ]] || options_binary_args="--binary=$options_binary"
+    [[ -z $options_debug ]] || {
+        options_debug='--debug'
+        options_verbose='--verbose'
+    }
+}
+
+function execute() {
+    readonly scriptname=$(basename "$0")
+
+    (($(comma_options_has --bash-completion $@))) && {
+        bash_completion
+        exit 0
+    }
+    (($(comma_options_has --help $@) || $(comma_options_has -h $@))) && usage
+    handle_info_options "$@"
+
+    local options_task="$1"
+
+    local mangle_text
+    mangle_text=$(
+        run_options | comma-options-to-name-value $@ | grep '=' | comma_path_value_mangle | sed 's/^/local options_/g'
+        comma_status_ok
+    ) ||
+        die "Invalid arguments."
+    eval "$mangle_text"
+
+    local options_verbose options_binary_args options_extremum options_extremum_fields options_axis
+    check_and_amend_options
+    unset options_up
+
+    mangle_text=$(${options_task}_operation) || die "Invalid operation '$options_task'"
+    [[ -z $options_dry_run ]] && eval "$mangle_text" || echo "$mangle_text"
+}
+
+execute "$@"

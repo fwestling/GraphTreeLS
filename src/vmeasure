@@ -1,0 +1,10 @@
+#!/usr/bin/python3
+# Calculates vmeasure of input
+
+# Inputs: 2ui: seg_a,seg_b
+
+import sys
+import numpy as np
+from sklearn.metrics.cluster import v_measure_score
+DATA = np.genfromtxt(sys.stdin.readlines(), delimiter=',')
+print(v_measure_score(DATA[:, 0], DATA[:, 1]))

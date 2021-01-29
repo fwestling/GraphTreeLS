@@ -1,0 +1,321 @@
+#!/bin/bash
+
+# Produces edges for a graph operation using the given point cloud
+
+export readonly name=$( basename $0 )
+
+source $( type -p comma-application-util ) || (error "comma not installed")
+function errcho { (>&2 echo "$name: $1") }
+function error
+{
+    errcho "error: $1"
+    exit 1
+}
+
+
+function go() {
+  local op=$1
+  local bin=$2
+  local fields=$3
+  local rad=$4
+  local cores=$5
+  local calcFields=$6
+
+  local cf=$(echo $fields | csv-fields clear)
+  local xf=$(echo $fields | csv-fields clear --except=x,y,z)
+
+  local fieldsA=$(echo $fields | csv-fields prefix --path=A)
+  local fieldsB=$(echo $fields | csv-fields prefix --path=B)
+
+  [[ $verbose ]] && echo "Starting edge generation" >&2
+  cat $NODES | points-join --binary=$bin --fields=$xf "$NODES;binary=$bin;fields=$xf" --all --radius=$rad 2>/dev/null |
+    #######################################################
+    ##                       BASIC                       ##
+    #######################################################
+    if [[ $op == "basic" ]]
+    then
+      [[ $verbose ]] && echo "Basic operation" >&2
+      local ptsF=$(echo $fields | csv-fields clear --except x,y,z | csv-fields prefix --path=first )
+      local ptsS=$(echo $fields | csv-fields clear --except x,y,z | csv-fields prefix --path=second )
+
+      points-calc distance --binary=$bin,$bin --fields=$ptsF,$ptsS |
+      csv-shuffle -b=$bin,$bin,d -f=$fieldsA,$fieldsB,dist -o=A/x,A/y,A/z,A/id,B/x,B/y,B/z,B/id,dist | tee temp_midpoint.bin
+      ########################################################
+      ##                      BY CLASS                      ##
+      ########################################################
+    elif [[ $op == "byclass" ]]
+      then
+        [[ $verbose ]] && echo "Basic operation" >&2
+        local ptsF=$(echo $fields | csv-fields clear --except x,y,z | csv-fields prefix --path=first )
+        local ptsS=$(echo $fields | csv-fields clear --except x,y,z | csv-fields prefix --path=second )
+
+        points-calc distance --binary=$bin,$bin --fields=$ptsF,$ptsS |
+        csv-shuffle -b=$bin,$bin,d -f=$fieldsA,$fieldsB,dist -o=A/x,A/y,A/z,A/id,B/x,B/y,B/z,B/id,A/input/cl,B/input/cl |
+        csv-eval --binary=3d,ui,3d,ui,2ui --fields=,,,,,,,,Aid,Bid "dist=Aid+Bid" --output-format=d |
+        csv-shuffle -b=3d,ui,3d,ui,2ui,d -f=ax,ay,az,ai,bx,by,bz,bi,ac,bc,d -o=ax,ay,az,ai,bx,by,bz,bi,d | tee temp_midpoint.bin
+        ########################################################
+        ##                     SIMILARITY                     ##
+        ########################################################
+      elif [[ $op == "norm2" ]]
+        then
+          [[ $verbose ]] && echo "Norm2 similarity operation, using fields:" >&2
+          cFields=$(echo $fields | csv-fields clear --except $calcFields | tr '/' '_')
+          calcBin=$(echo $bin | csv-format expand | csv-fields clear --mask=$cFields | csv-fields cut --empty | csv-format collapse)
+          [[ $verbose ]] && echo $cFields :: $calcBin >&2
+
+          fA=$(echo $cFields | csv-fields prefix --path=A | tr '/' '_')
+          fB=$(echo $cFields | csv-fields prefix --path=B | tr '/' '_')
+
+          [[ $verbose ]] && echo $fA :: $fB >&2
+
+          sqSum=$(echo $calcFields | tr '/' '_' | sed -r 's/([a-zA-Z_]+)/(A_\1-B_\1)**2/g' | tr ',' '+')
+
+          [[ $verbose ]] && echo SUM: $sqSum >&2
+
+          csv-eval --binary=$bin,$bin --fields=$fA,$fB "edge_weight=sqrt($sqSum)" |
+          csv-shuffle -b=$bin,$bin,d -f=$fieldsA,$fieldsB,dist -o=A/x,A/y,A/z,A/id,B/x,B/y,B/z,B/id,dist | tee temp_midpoint.bin
+    ########################################################
+    ##                       COSINE                       ##
+    ########################################################
+  elif [[ $op == "cosine" ]]
+      then
+        [[ $verbose ]] && echo "Cosine similarity operation, using fields:" >&2
+        cFields=$(echo $fields | csv-fields clear --except $calcFields | tr '/' '_')
+        calcBin=$(echo $bin | csv-format expand | csv-fields clear --mask=$cFields | csv-fields cut --empty | csv-format collapse)
+        [[ $verbose ]] && echo $cFields :: $calcBin >&2
+
+        fA=$(echo $cFields | csv-fields prefix --path=A | tr '/' '_')
+        fB=$(echo $cFields | csv-fields prefix --path=B | tr '/' '_')
+
+        [[ $verbose ]] && echo $fA :: $fB >&2
+
+        # Cosine similarity is x.y/(norm(x)*norm(y)
+        dot=$(echo $calcFields | tr '/' '_' | sed -r 's/([a-zA-Z_]+)/(A_\1*B_\1)/g' | tr ',' '+')
+        normA=$(echo $calcFields | tr '/' '_' | sed -r 's/([a-zA-Z_]+)/(A_\1)**2/g' | tr ',' '+')
+        normB=$(echo $calcFields | tr '/' '_' | sed -r 's/([a-zA-Z_]+)/(B_\1)**2/g' | tr ',' '+')
+
+        [[ $verbose ]] && echo DOT: $dot >&2
+        [[ $verbose ]] && echo ANO: $normA >&2
+        [[ $verbose ]] && echo BNO: $normB >&2
+
+        csv-eval --binary=$bin,$bin --fields=$fA,$fB "d=$dot;na=$normA;nb=$normB;edge_weight=d/(na*nb)" --output-fields=edge_weight |
+        csv-shuffle -b=$bin,$bin,d -f=$fieldsA,$fieldsB,dist -o=A/x,A/y,A/z,A/id,B/x,B/y,B/z,B/id,dist | tee temp_midpoint.bin
+    #######################################################
+    ##                       ANGLE                       ##
+    #######################################################
+    elif [[ $op == "angle" ]]
+    then
+      [[ $verbose ]] && echo "Angle operation" >&2
+      fA=$(echo $fields | csv-fields prefix --path=A | tr '/' '_')
+      fB=$(echo $fields | csv-fields prefix --path=B | tr '/' '_')
+
+      [[ $verbose ]] && echo $fA :: $fB >&2
+
+      csv-eval --binary=$bin,$bin --fields=$fA,$fB "dot=A_vx*B_vx+A_vy*B_vy+A_vz*B_vz;lengthA=sqrt(A_vx*A_vx+A_vy*A_vy+A_vz*A_vz);lengthB=sqrt(B_vx*B_vx+B_vy*B_vy+B_vz*B_vz);angle=arccos(dot / (lengthA*lengthB))" --output-fields=angle |
+      # csv-eval --binary=$bin,$bin --fields=$fA,$fB "angle=A_vx*B_vx+A_vy*B_vy+A_vz*B_vz" --output-fields=angle |
+      csv-shuffle -b=$bin,$bin,d -f=$fieldsA,$fieldsB,dist -o=A/x,A/y,A/z,A/id,B/x,B/y,B/z,B/id,dist | tee temp_midpoint.bin
+    ########################################################
+    ##                       UPHILL                       ##
+    ########################################################
+    elif [[ $op == "uphill" ]]
+    then
+      [[ $verbose ]] && echo "Uphill operation on " $calcFields >&2
+      cFields=$(echo $fields | csv-fields clear --except $calcFields | tr '/' '_')
+      fA=$(echo $cFields | csv-fields prefix --path=A | tr '/' '_')
+      fB=$(echo $cFields | csv-fields prefix --path=B | tr '/' '_')
+
+      calcEq=$(echo $calcFields | tr '/' '_' | sed -r 's/([a-zA-Z_]+)/(B_\1-A_\1)/g' | tr ',' '+' )
+      n=$(echo $calcFields | csv-fields numbers --size)
+      [[ $verbose ]] && echo $fA :: $fB >&2
+
+      csv-eval --binary=$bin,$bin --fields=$fA,$fB "edge_weight=($calcEq)/$n" --output-format=d |
+      # csv-eval --binary=$bin,$bin --fields=$fA,$fB "angle=A_vx*B_vx+A_vy*B_vy+A_vz*B_vz" --output-fields=angle |
+      csv-shuffle -b=$bin,$bin,d -f=$fieldsA,$fieldsB,dist -o=A/x,A/y,A/z,A/id,B/x,B/y,B/z,B/id,dist | tee temp_midpoint.bin
+    ########################################################
+    ##                      DOWNHILL                      ##
+    ########################################################
+    elif [[ $op == "downhill" ]]
+    then
+      [[ $verbose ]] && echo "Downhill operation on " $calcFields >&2
+      fA=$(echo $cFields | csv-fields prefix --path=A | tr '/' '_')
+      fB=$(echo $cFields | csv-fields prefix --path=B | tr '/' '_')
+      cFields=$(echo $fields | csv-fields clear --except $calcFields | tr '/' '_')
+
+      calcEq=$(echo $calcFields | tr '/' '_' | sed -r 's/([a-zA-Z_]+)/(A_\1-B_\1)/g' | tr ',' '+' )
+      n=$(echo $calcFields | csv-fields numbers --size)
+      [[ $verbose ]] && echo $fA :: $fB >&2
+
+      csv-eval --binary=$bin,$bin --fields=$fA,$fB "edge_weight=($calcEq)/$n" --output-format=d |
+      # csv-eval --binary=$bin,$bin --fields=$fA,$fB "angle=A_vx*B_vx+A_vy*B_vy+A_vz*B_vz" --output-fields=angle |
+      csv-shuffle -b=$bin,$bin,d -f=$fieldsA,$fieldsB,dist -o=A/x,A/y,A/z,A/id,B/x,B/y,B/z,B/id,dist | tee temp_midpoint.bin
+    else
+      [[ $verbose ]] && echo "No operation; producing unweighted graph" >&2
+      csv-paste "-;binary=$bin,$bin" "value=0;binary=d" |
+      csv-shuffle -b=$bin,$bin,d -f=$fieldsA,$fieldsB,dist -o=A/x,A/y,A/z,A/id,B/x,B/y,B/z,B/id,dist | tee temp_midpoint.bin
+    fi | tee temp2.bin |
+
+    if [[ $SQUARE ]]
+    then
+      [[ $verbose ]] && echo "SQUARING" >&2
+      csv-eval --binary=3d,ui,3d,ui,d --fields=,,,,,,,,w "w=w**2"
+    else
+      cat
+    fi |
+
+    if [[ $INVERSE ]]
+    then
+      [[ $verbose ]] && echo "INVERTING" >&2
+      csv-eval --binary=3d,ui,3d,ui,d --fields=,,,,,,,,w "w=1/(w+0.1)"
+    else
+      cat
+    fi |
+
+    if [[ $show ]]
+    then
+    #   [[ $verbose ]] && echo "Visualising" >&2
+      cat > $VIS
+      minmax=$(cat $VIS | csv-calc min,max --binary=3d,ui,3d,ui,d --fields=,,,,,,,,x | csv-from-bin 2d)
+      min=$(echo $minmax | cut -d, -f1)
+      max=$(echo $minmax | cut -d, -f2)
+      echo "$minmax" >&2
+      cat $VIS |
+        tee >(view-points "-;binary=3d,ui,3d,ui,d;fields=first,,second,,scalar;colour=$min:$max,jet;shape=line" \
+        "7.bin;binary=3d,3ui;fields=x,y,z,scalar;colour=0:3,orange:green;weight=4" --camera-config=temp.camera --background-colour=white)
+          # "7.bin;binary=3d,3ui;fields=x,y,z,scalar;colour=0:3,orange:green" )
+    else
+      cat
+    fi |
+
+    if [[ $DEV ]]
+    then
+      points-join --binary=3d,ui,3d,ui,d --fields=x,y,z "$NODES;fields=$xf;binary=$bin" --radius=0.001 |
+        csv-shuffle --binary=3d,ui,3d,ui,d,$bin --fields=A/x,A/y,A/z,A/id,B/x,B/y,B/z,B/id,dist,$fields  -o=A/x,A/y,A/z,A/id,B/x,B/y,B/z,B/id,dist,input/cl |
+        points-join --binary=3d,ui,3d,ui,d,ui --fields=,,,,x,y,z "$NODES;fields=$xf;binary=$bin" --radius=0.001 |
+        csv-shuffle --binary=3d,ui,3d,ui,d,ui,$bin --fields=A/x,A/y,A/z,A/id,B/x,B/y,B/z,B/id,dist,A/cl,$fields  -o=dist,A/cl,input/cl,A/x,A/y,A/z |
+        csv-cast --binary=d,2ui,3d --to=d,2d,3d |
+        # csv-eval --binary=d,2d,3d --fields=dist,Acl,Bcl "score=dist*(1+Acl+Bcl)" |
+        # csv-eval --binary=d,2d,3d --fields=dist,Acl,Bcl "score=(5+abs(Acl-Bcl))*1/dist" |
+        # csv-eval --binary=d,2d,3d --fields=dist,Acl,Bcl "score=(where(Acl>Bcl,dist,-dist))" |
+
+        # I expect "distance" to be high when Acl != Bcl
+        # and low when Acl = Bcl
+        # I want high score when that's true, and low when it's false.
+
+        csv-eval --binary=d,2d,3d --fields=dist,Acl,Bcl "score=dist*abs(Acl-Bcl)" |
+        csv-shuffle -b=d,2d,4d -f=dist,,,x,y,z,score -o=x,y,z,score |
+        tee >(view-points --binary=4d --fields=x,y,z,scalar --colour=0:5,jet --weight=10 --camera-config=temp.camera) |
+        csv-calc mean --binary=4d --fields=,,,x | csv-from-bin d
+
+    else
+      csv-shuffle -b=3d,ui,3d,ui,d -f=A/x,A/y,A/z,A/id,B/x,B/y,B/z,B/id,dist -o=A/id,B/id,dist
+    fi
+    # csv-shuffle -b=3d,ui,3d,ui,d -f=x,y,z,idA,x,y,z,idB,d -o=idA,idB,d
+}
+
+function option-description
+{
+    cat <<eof
+--binary=[<format>]; default=3d; Binary format used in point cloud
+--fields=[<fields>]; default=x,y,z,id; Point cloud fields, must include "x,y,z,id".  Other fields may be requried depending on the chosen operation
+--calc-fields=[<fields>]; Fields by which to calculate similarity.
+--radius=[<size>]; default=0.2; Distance to
+--cores=[<cores>]; default=4; Number of cores to use when parallelising.
+--verbose, -v; Output progress to stderr
+--output-fields; Don't process, just list the output fields
+--output-format; Don't process, just list the output format
+--output-nodes=[<file>]; filename into which nodes should be saved with x,y,z,id format
+--show; Visualise the graph
+--dev; Output edge direction re trunk vs leaf id
+--invert; compute inverse weight metric
+--square; compute squared weight metric
+eof
+}
+
+
+function usage
+{
+    cat <<eof
+
+$name Creates an edge graph using the given point cloud.
+Fields should include "x,y,z" and "id" ; "id" represents the NODE ID of the point.
+Only one point per ID is expected, however if more are provided the average location and parameters will be taken.
+
+usage: cat <point_cloud> | $name <operation> [options]
+
+options: $( option-description  | sed 's/^/    /g' )
+
+Operations:
+  basic: weight is based on distance between nodes; no fields required
+  norm2: Similary using norm2 applied to all "calc" fields (requires "--calc-fields")
+  cosine: Similary using cosine applied to all "calc" fields (requires "--calc-fields")
+  angle: Weight based on angle between vectors (requires fields "vx,vy,vz")
+  uphill: Asymmetric; Want to go towards regions with higher values (requires "--calc-fields" ; mean difference of all named fields used)
+  downhill: Asymmetric; Want to go towards regions with lower values (requires "--calc-fields" with one value ; mean difference of all named fields used)
+example usage:
+  cat xyz.bin | $name > rich.bin
+
+eof
+    exit 1
+}
+
+if (( $( comma_options_has --help $@ ) || $( comma_options_has -h $@ ) )) ; then usage ; fi
+options=$( option-description | comma-options-to-name-value "$@" ) || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<< "$options"
+eval "$( option-description | comma-options-to-name-value "$@" | comma_path_value_mangle )"
+
+# set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+export readonly TEMPDIR=$(mktemp -d)
+[[ $verbose ]] && echo "Temp dir: $TEMPDIR" >&2
+
+export readonly NODES=$TEMPDIR/nodes.bin
+export readonly VIS=$TEMPDIR/vis.bin
+
+
+if [[ $1 == "similarity" ]] ; then (( $( comma_options_has --calc-fields $@ ) )) || error "--calc-fields required" ; fi
+if [[ $1 == "angle" ]] ; then echo $options_fields | csv-fields has --fields vx,vy,vz || error "angle op requires vector fields vx,vy,vz" ; fi
+
+ofields=$(csv-calc mean --binary=$options_binary --fields=$options_fields --output-fields | sed 's/\/mean//g')
+oformat=$(csv-calc mean --binary=$options_binary --fields=$options_fields --output-format)
+# cat | csv-calc mean --binary=$options_binary --fields=$options_fields |
+# csv-shuffle -b=$oformat -f=$ofields -o=$options_fields > $NODES
+# echo FORMAT: $oformat >&2
+
+if (( $( comma_options_has --output-nodes "$@" ) ))
+then
+  echo "Teeing" >&2
+    cat | csv-calc mean --binary=$options_binary --fields=$options_fields |
+      csv-shuffle -b=$oformat -f=$ofields -o=$options_fields | tee $NODES |
+      csv-shuffle -b=$options_binary -f=$options_fields -o=x,y,z,id > $options_output_nodes
+else
+  echo "Not teeing" >&2
+  cat | csv-calc mean --binary=$options_binary --fields=$options_fields |
+    csv-shuffle -b=$oformat -f=$ofields -o=$options_fields > $NODES
+fi
+
+function cleanup() {
+  # rm -rf $TEMPDIR
+  exit
+}
+
+trap cleanup EXIT
+trap cleanup INT
+
+(( $( comma_options_has --verbose "$@" ) )) && export readonly verbose=true
+(( $( comma_options_has --output-format "$@" ) )) && export readonly OUTFO=true
+(( $( comma_options_has --output-fields "$@" ) )) && export readonly OUTFI=true
+(( $( comma_options_has --invert "$@" ) )) && export readonly INVERSE=true
+(( $( comma_options_has --square "$@" ) )) && export readonly SQUARE=true
+(( $( comma_options_has --dev "$@" ) )) && export readonly DEV=true
+
+if [[ $OUTFI ]]
+then
+  echo -n "Output fields: " >&2
+  echo "node_id_a,node_id_b,edge_weight"
+elif [[ $OUTFO ]]
+then
+  echo -n "Output format: " >&2
+    echo "2ui,d" | csv-format collapse
+else
+    go $1 $options_binary $options_fields $options_radius $options_cores $options_calc_fields
+fi

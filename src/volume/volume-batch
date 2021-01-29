@@ -1,0 +1,71 @@
+r: $TEMPDIR" >&2
+export readonly VOXI=$TEMPDIR/voxi.bin
+export readonly VOXM=$TEMPDIR/voxall.bin
+export readonly EIGEN=$TEMPDIR/eigen.bin
+
+export readonly eigen_bin="12d"
+export readonly eigen_fields="eA/x,eA/y,eA/z,eB/x,eB/y,eB/z,eC/x,eC/y,eC/z,vA,vB,vC"
+
+export readonly sf1_bin="7d"
+export readonly sf1_fields="eigen/la,eigen/ll,eigen/lp,eigen/lv,eigen/lo,eigen/ls,eigen/le"
+
+
+function cleanup() {
+  rm -rf $TEMPDIR
+  exit
+}
+
+trap cleanup EXIT
+trap cleanup INT
+
+(( $( comma_options_has --verbose "$@" ) )) && export readonly verbose=true
+(( $( comma_options_has --output-fields "$@" ) )) && export readonly OUTFI=true
+(( $( comma_options_has --output-format "$@" ) )) && export readonly OUTFO=true
+(( $( comma_options_has --normalize "$@" ) )) && export readonly NORMALIZE=true
+
+if [[ $OUTFI ]]
+then
+  echo -n "Output fields: " >&2
+  echo "$(echo $fields | csv-fields prefix --path=input --except=x,y,z),voxConn,voxConnV,voxConnH,vox_id,$eigen_fields,$sf1_fields,num_pts,meanX,meanY,meanZ,varX,varY,varZ,areaV,areaZ,volume,densA,densB"
+elif [[ $OUTFO ]]
+then
+  echo -n "Output format: " >&2
+  if [[ $NORMALIZE ]]
+  then
+    echo "$binary,3d,ui,$eigen_bin,$sf1_bin,d,3d,3d,3d,2d" | csv-format collapse
+  else
+    echo "$binary,4ui,$eigen_bin,$sf1_bin,ui,3d,3d,3d,2d" | csv-format collapse
+  fi
+else
+  if [[ $NORMALIZE ]]
+  then
+    normFields=$(echo $fields | csv-fields clear),,,,,$(echo $eigen_fields | csv-fields clear),$sf1_fields,num_pts,meanX,meanY,meanZ,varX,varY,varZ,areaV,areaZ,volume,densA,densB
+    [[ $verbose ]] && echo "NORMALISED FIELDS: $fields,voxConn,voxConnV,voxConnH,vox_id,$eigen_fields,$sf1_fields,num_pts,meanX,meanY,meanZ,varX,varY,varZ,areaV,areaZ,volume,densA,densB" >&2
+    go $options_binary $options_fields $options_voxel_size $options_cores | tee temp_prenorm.bin |
+      csv-cast $binary,4ui,$eigen_bin,$sf1_bin,ui,3d,3d,3d,2d $binary,3d,ui,$eigen_bin,$sf1_bin,ui,3d,3d,3d,2d --force |
+      csv-eval --binary=$binary,3d,ui,$eigen_bin,$sf1_bin,ui,3d,3d,3d,2d --fields=$fields,con,vert,horz "con=con/26.0;vert=vert/18.0;horz=horz/9.0" |
+      if [[ $verbose ]]
+      then
+        echo "Normalising fields..." >&2
+        echo "Binary: $binary,3d,ui,$eigen_bin,$sf1_bin,ui,3d,3d,3d,2d" >&2
+        echo "Fields: $normFields" >&2
+        cat
+      else
+        cat
+      fi |
+      ~/src/tree-crops/phenotyping-lidar/normalise-fields \
+        --binary=$binary,3d,ui,$eigen_bin,$sf1_bin,ui,3d,3d,3d,2d \
+        --fields=$normFields
+  else
+    go $options_binary $options_fields $options_voxel_size $options_voxel_threshold $options_cores
+  fi
+fi
+
+
+# Testing:
+# cd /mnt/data/miniset/real
+# for f in *bin ; do echo $f >&2; cat $f | ~/src/tree-crops/phenotyping-lidar/enrich --binary=3d,3ui --fields=x,y,z,cl,seg,bId > enriched/$f ; done
+# cd /mnt/data/training/aligned
+# for f in */*bin ; do echo $f >&2; cat $f | ~/src/tree-crops/phenotyping-lidar/enrich --binary=3d,2ui,d --fields=x,y,z,cl,seg,h > ../enriched/$f ; done
+
+# cd /mnt/data/miniset/real ; for f in *bin ; do echo $f >&2; cat $f | ~/src/tree-crops/phenotyping-lidar/enrich --binary=3d,3ui --fields=x,y,z,cl,seg,bId > enriched/$f ; done ; cd /mnt/data/training/aligned ; for f in */*bin ; do echo $f >&2; cat $f | ~/src/tree-crops/phenotyping-lidar/enrich --binary=3d,2ui,d --fields=x,y,z,cl,seg,h > ../enriched/$f ; done

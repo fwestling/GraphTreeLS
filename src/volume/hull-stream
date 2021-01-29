@@ -1,0 +1,117 @@
+#!/usr/bin/python
+# Calculates volume of the convex hull of the input.
+
+# Inputs:
+#   Fields - List of fields in the input data; must include x,y; optional: z
+#   Data (list of points) should be input on STDIN
+
+import sys
+import numpy as np
+import argparse  # Can use getopts alternatively
+from scipy.spatial import ConvexHull
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import matplotlib.cm as cm
+import warnings
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('task', metavar='T', type=str, nargs=1,
+                        help='What do you want? (points | volume)',
+                        choices=['points', 'volume'])
+    parser.add_argument('-f', "--fields", type=str, default='a,b,c,id',
+                        help='list of fields in the input data')
+    parser.add_argument('-v', "--verbose", action="store_true",
+                        help="Print more output")
+    args = parser.parse_args()
+
+    fields = np.array(args.fields.split(','))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        DATA = np.genfromtxt(sys.stdin.readlines(), delimiter=',')
+
+    nDims = ((fields == 'x') + (fields == 'y') + (fields == 'z')).sum()
+    if (nDims < 2):
+        sys.stderr.write("Not enough dimension fields provided")
+
+    # If insufficient data is provided, give 0 volume or no hull
+    if DATA.size == 0 or DATA.shape[0] < 3 or len(DATA.shape) == 1:
+        if args.verbose:
+            sys.stderr.write("Insufficient data points provided\n")
+        if args.task[0] == 'volume':
+            print 0
+        elif args.task[0] == 'points':
+            sys.stdout.write("0")
+            print (nDims-1)*",0"
+        sys.exit(0)
+
+    if (fields == 'id').sum() > 0:
+        ids = DATA[:, fields == 'id']
+    else:
+        ids = np.zeros([DATA.shape[0], 1], dtype=np.uint8)
+
+    points = DATA[:, (fields == 'x') | (fields == 'y') | (fields == 'z')]
+
+    volume = 0
+    uIDs = np.unique(ids)
+    
+    vols= np.zeros((DATA.shape[0],1),dtype='float64') + volume
+    OUT = np.append(DATA,vols,axis=1)
+
+    finalLocation=DATA.shape[1]
+
+    for i, v in enumerate(uIDs):
+        try:
+            sys.stderr.write("A\n");
+            id_points = points[ids[:, 0] == v, :]
+            if id_points.shape[0] < 3:
+                continue
+            # When 3d data is provided but planar, convex hull cannot be calculated
+            sys.stderr.write("B\n");
+            if nDims == 3:
+                viable = np.array([True, True, True])
+            else:
+                viable = np.array([True,True])
+            if nDims == 3:
+                planar = np.array([False, False, False])
+            else:
+                planar = np.array([False,False])
+            if (id_points[:, 0].max() - id_points[:, 0].min() == 0):
+                if args.verbose:
+                    sys.stderr.write("Planar in the X dimension\n")
+                viable[0] = False
+                planar[0] = True
+                continue
+            sys.stderr.write("C\n");
+            if (id_points[:, 1].max() - id_points[:, 1].min() == 0):
+                if args.verbose:
+                    sys.stderr.write("Planar in the Y dimension\n")
+                viable[1] = False
+                planar[1] = True
+                continue
+            sys.stderr.write("D\n");
+            if (nDims == 3):
+                if (id_points[:, 2].max() - id_points[:, 2].min() == 0):
+                    if args.verbose:
+                        sys.stderr.write("Planar in the Z dimension\n")
+                    viable[2] = False
+                    planar[2] = True
+                    continue
+            sys.stderr.write("E\n");
+            id_points = id_points[:, viable]
+            sys.stderr.write("F\n");
+            if id_points.shape[0] <= 3:
+                if args.verbose:
+                    sys.stderr.write("Too few points in this voxel")
+                continue
+
+            hull = ConvexHull(id_points)
+            id_points = points[ids[:, 0] == v, :]
+            points[ids[:, 0] == v, :]
+            OUT[ids[:,0] == v, finalLocation] = hull.volume
+        except:
+            sys.stderr.write("Error found; likely a planar voxel\n")
+
+    np.savetxt(sys.stdout, OUT, delimiter=',')

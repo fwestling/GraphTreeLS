@@ -1,0 +1,121 @@
+#!/bin/bash
+
+# Script to visualise the effect of voxelising a point cloud at a particular size
+
+export readonly name=$( basename $0 )
+source $( type -p comma-application-util ) || (error "comma not installed")
+function errcho { (>&2 echo "$name: $1") }
+function error
+{
+    errcho "error: $1"
+    exit 1
+}
+
+# Given a resolution, generate a rough cube of points
+function cubify(){
+  res=$1
+
+  bound=`echo $res | csv-eval --format=d --fields=x "x=x/2"`
+  int=`echo $res | csv-eval --format=d --fields=x "x=x/10"`
+
+
+  for x in `seq -$bound $int $bound`
+  do
+    for y in `seq -$bound $int $bound`
+    do
+      for z in `seq -$bound $int $bound`
+      do
+        echo "0,$x,$y,$z"
+      done
+    done
+  done | csv-to-bin ui,3d
+}
+
+function go() {
+  pc=$1
+  bin=$2
+  fields=$3
+  res=$4
+
+  BOX=`mktemp`
+
+  cubify $res > $BOX
+
+  ## Finding duplicate voxel assignments
+  # cat $pc | csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+  #   csv-paste "-;binary=3d" line-number |
+  #   points-to-voxel-indices --binary=3d,ui --fields=x,y,z,l --resolution=$res |
+  #   csv-sort --binary=3d,ui,3ui --fields=,,,,i,j,k |
+  #   csv-blocks group --binary=3d,4ui --fields=,,,,id,id,id |
+  #   csv-shuffle -b=3d,ui,3ui,ui --fields=x,y,z,line,i,j,k,id -o=id,x,y,z,line |
+  #   view-points --binary=ui,3d,ui --fields=id,x,y,z | points-calc distance
+
+
+
+  ## Using points-to-voxels
+  cat $pc | points-to-voxels --binary=$bin --fields=$fields --resolution=$res |
+    csv-sort --binary=3ui,3d,ui --fields=i,j,k |
+    csv-blocks group --binary=3ui,3d,ui --fields=id,id,id |
+    csv-paste "-;binary=3ui,3d,ui,ui" "value=0;binary=ui" |
+    csv-shuffle --binary=3ui,3d,3ui --fields=i,j,k,x,y,z,w,b,s -o=s,b,x,y,z,w |
+    csv-join --binary=2ui,3d,ui --fields=id "$BOX;binary=ui,3d;fields=id" |
+    csv-shuffle -b=2ui,3d,ui,ui,3d -f=s,b,xc,yc,zc,w,i,x,y,z -o=b,xc,yc,zc,x,y,z,w |
+    csv-eval -b=ui,6d,ui --fields=,xc,yc,zc,x,y,z "x=x+xc;y=y+yc;z=z+zc" |
+    csv-shuffle -b=ui,6d,ui --fields=b,,,,x,y,z,w -o=b,x,y,z,w |
+    view-points "-;binary=ui,3d,ui;fields=id,x,y,z" "$pc;binary=$bin;fields=$fields;weight=5;colour=white"
+
+
+  ## Manually defining voxels
+  # cat $pc | csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+  #   csv-eval --binary=3d --fields=x,y,z "i=round(x/$res);j=round(y/$res);k=round(z/$res)" --output-format=3ui |
+  #   csv-sort --binary=3d,3ui --fields=,,,i,j,k |
+  #   csv-blocks group --binary=3d,3ui --fields=,,,id,id,id |
+  #   csv-paste "-;binary=3d,3ui,ui" "value=0;binary=ui" |
+  #   csv-shuffle --binary=3d,3ui,2ui --fields=x,y,z,i,j,k,b,s -o=s,b,x,y,z |
+  #   csv-calc centre --binary=2ui,3d --fields=s,block,x,y,z |
+  #   csv-join --binary=ui,3d,ui --fields=id "$BOX;binary=ui,3d;fields=id" |
+  #   csv-shuffle -b=ui,3d,ui,ui,3d -f=s,xc,yc,zc,b,i,x,y,z -o=b,xc,yc,zc,x,y,z |
+  #   csv-eval -b=ui,6d --fields=,xc,yc,zc,x,y,z "x=x+xc;y=y+yc;z=z+zc" |
+  #   csv-shuffle -b=ui,6d --fields=b,,,,x,y,z,w -o=b,x,y,z |
+  #   view-points "-;binary=ui,3d;fields=id,x,y,z" "$pc;binary=$bin;fields=$fields;weight=5;colour=white"
+
+    rm $BOX
+}
+
+function option-description
+{
+    cat <<eof
+--binary=[<format>]; default=3d; Binary format used in point cloud
+--fields=[<fields>]; default=x,y,z; Point cloud fields, must include "x,y,z"
+--resolution=[<size>]; default=0.1; Size (m) to use for voxelisation
+--verbose, -v; Output progress to stderr
+eof
+}
+
+function usage
+{
+    cat <<eof
+
+$name takes a point cloud and estimates the volume represented therein.
+
+Positional argument: Point cloud to measure
+
+usage: $name [<point_cloud>] [options]
+
+options:
+$( option-description  | sed 's/^/    /g' )
+
+eof
+    exit 1
+}
+
+if (( $( comma_options_has --help $@ ) || $( comma_options_has -h $@ ) )) ; then usage ; fi
+options=$( option-description | comma-options-to-name-value "$@" ) || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<< "$options"
+eval "$( option-description | comma-options-to-name-value "$@" | comma_path_value_mangle )"
+
+(( $( comma_options_has --verbose "$@" ) )) && export readonly verbose=true
+
+set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+go $1 $options_binary $options_fields $options_resolution

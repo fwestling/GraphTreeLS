@@ -1,0 +1,85 @@
+#!/bin/bash
+
+# Utility to validate remove "trunk" section of tree
+
+export readonly name=$(basename $0)
+
+source $(type -p comma-application-util) || (error "comma not installed")
+function errcho() { (echo >&2 "$name: $1"); }
+function error() {
+  errcho "error: $1"
+  exit 1
+}
+
+function doCloud_slices() {
+  bin=$1
+  fields=$2
+  size=$3
+
+  cat |
+    csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+    csv-eval --binary=3d --fields=x,y,z "i=floor(z/$size)" --output-format=ui |
+    csv-from-bin 3d,ui |
+    vol-conv-hull volume -f=x,y,z,id 2>/dev/null
+}
+
+function go() {
+  bin=$1
+  fields=$2
+  size=$3
+
+  cxFields=$(echo $fields | csv-fields clear --except=x,y,z)
+  czFields=$(echo $fields | csv-fields clear --except=z)
+  cFields=$(echo $fields | csv-fields clear)
+
+  cat | filter-voxweight --binary=$bin --fields=$fields --voxel-size=0.05 --threshold=1 --flag |
+    csv-calc percentile=0.99 --binary=$bin,ui --fields=$czFields --append |
+    csv-eval --binary=$bin,ui,d --fields=$czFields,keep,p "keep=where(keep==0,0,where(z>p,0,1))" |
+    if [[ $show ]]; then
+      tee >(view-points "-;binary=$bin,ui,d;fields=$cxFields,scalar;colour=0:1,red:green;weight=4" \
+        --size=5000000)
+    else
+      cat
+    fi |
+    csv-select --binary=$bin,ui,d --fields=$cFields,k "k;equals=1" |
+    csv-shuffle -b=$bin,ui,d -f=$fields -o=$fields
+  # csv-eval --binary=$bin --fields=$cxFields "i=floor(z/$size)" --output-format=ui |
+  # csv-calc size --binary=$bin,ui --fields=$cxFields,id |
+
+}
+
+function option-description() {
+  cat <<eof
+--binary=[<format>]; default="3d"; Binary format used in point clouds
+--fields=[<fields>]; default="x,y,z"; Point cloud fields, must include "x,y,z".  Can include "id".
+--size=[<size>]; default=0.2; Size to use for slicing or voxelising
+--verbose, -v; Output progress to stderr
+--show, -s; Visualise removed elements
+eof
+}
+
+function usage() {
+  cat <<eof
+
+$name Extracts just the "canopy" of the given tree
+
+usage: cat pointcloud | $name <operation> [options]
+
+options:
+$(option-description | sed 's/^/    /g')
+
+eof
+  exit 1
+}
+
+if (($(comma_options_has --help $@) || $(comma_options_has -h $@))); then usage; fi
+options=$(option-description | comma-options-to-name-value "$@") || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<<"$options"
+eval "$(option-description | comma-options-to-name-value "$@" | comma_path_value_mangle)"
+
+(($(comma_options_has --verbose "$@"))) && export readonly verbose=true
+(($(comma_options_has --show "$@"))) && export readonly show=true
+
+set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+cat | go $options_binary $options_fields $options_size

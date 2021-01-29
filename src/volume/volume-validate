@@ -1,0 +1,103 @@
+#!/bin/bash
+
+# Simple method for calculating volume
+
+export readonly name=$( basename $0 )
+export readonly script="vol-conv-hull"
+source $( type -p comma-application-util ) || (error "comma not installed")
+function errcho { (>&2 echo "$name: $1") }
+function error
+{
+    errcho "error: $1"
+    exit 1
+}
+
+function slice() {
+    pc=$1
+    bin=$2
+    fields=$3
+    z=$4
+    d=$5
+    op=$6
+    script=$7
+    verbose=$8
+    
+    [[ $verbose ]] && echo -n "." >&2
+    zn=$(echo "$z" | csv-eval --format=d --fields=z "z=z+$d")
+    
+    cat $pc |
+    csv-eval --binary=$bin --fields=`echo $fields | csv-fields clear --except=z` "i=z/$d" --output-format=ui |
+    csv-select --binary=$bin,ui --fields=`echo $fields | csv-fields clear`",i" "i;equals=$z" |
+    csv-shuffle --binary=$bin,ui --fields=$fields -o=$fields |
+    csv-from-bin $bin |
+    $script $op --fields=`echo $fields | csv-fields clear --except=x,y,z`
+}
+
+function go() {
+    pc=$1
+    bin=$2
+    fields=$3
+    slices=$4
+    
+    zbounds=$(cat $pc | csv-calc min,max --binary=$bin --fields=`echo "$fields" | csv-fields clear --except z` | csv-from-bin 2d)
+    d=$(echo "$zbounds" | csv-eval --format=2d --fields=min,max "d=(max-min)/$slices" | cut -d, -f3)
+    d=0.5
+    
+    ids=$(cat $pc |
+        csv-eval --binary=$bin --fields=`echo $fields | csv-fields clear --except=z` "i=z/$d" --output-format=ui |
+        csv-shuffle --binary=$bin,ui --fields=`echo $fields | csv-fields clear`",i" -o=i |
+    csv-from-bin ui | sort | uniq | tr ' ' '\n')
+    
+    export -f slice
+    if [[ $show ]]
+    then
+        echo "$ids" | parallel -n1 slice $pc $bin $fields {} $d points $script $verbose |
+        csv-to-bin 3d | csv-from-bin 3d |
+        view-points "-;fields=x,y,z;colour=red;weight=10" "$pc;binary=$bin;fields=$fields"
+    fi
+    
+    echo "$ids" | parallel -n1 slice $pc $bin $fields {} $d volume $script $verbose |
+    # csv-eval --format=d --fields=v "v=v*$d" |
+    csv-calc sum --format=d --fields=vol
+    
+}
+
+function option-description
+{
+    cat <<eof
+--binary=[<format>]; default=3d; Binary format used in point cloud
+--fields=[<fields>]; default=x,y,z; Point cloud fields, must include "x,y,z"
+--slices=[<size>]; default=10; Number of slices to use
+--verbose, -v; Output progress to stderr
+--show, -s; Visualise the convex hull used
+eof
+}
+
+function usage
+{
+    cat <<eof
+
+$name takes a point cloud and estimates the volume represented therein.
+
+Positional argument: Point cloud to measure
+
+usage: File $name [<point_cloud>] [options]
+
+options:
+$( option-description  | sed 's/^/    /g' )
+
+eof
+    exit 1
+}
+
+if (( $( comma_options_has --help $@ ) || $( comma_options_has -h $@ ) )) ; then usage ; fi
+options=$( option-description | comma-options-to-name-value "$@" ) || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<< "$options"
+eval "$( option-description | comma-options-to-name-value "$@" | comma_path_value_mangle )"
+
+(( $( comma_options_has --verbose "$@" ) )) && export readonly verbose=true
+(( $( comma_options_has --show "$@" ) )) && export readonly show=true
+
+# set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+go $1 $options_binary $options_fields $options_slices

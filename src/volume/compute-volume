@@ -1,0 +1,309 @@
+#!/bin/bash
+
+# Utility to validate performance of volume script
+
+export readonly name=$(basename $0)
+
+source $(type -p comma-application-util) || (error "comma not installed")
+function errcho() { (echo >&2 "$name: $1"); }
+function error() {
+  errcho "error: $1"
+  exit 1
+}
+
+function doCloud_manual() {
+  bin=$1
+  fields=$2
+  size=$3
+
+  cat |
+    csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+    csv-eval --binary=3d --fields=x,y,z "i=floor(z/$size)" --output-format=ui |
+    csv-calc min,max --binary=3d,ui --fields=x,y,,id |
+    csv-eval --binary=4d,ui --fields=min_x,min_y,max_x,max_y "xd=max_x-min_x;yd=max_y-min_y;mxd=where(xd>yd,xd,yd)/2;vol=pi*mxd*mxd*$size" -o=vol |
+    csv-calc sum --binary=4d,ui,d --fields=,,,,,vol | csv-from-bin d
+}
+
+function doCloud_manualrect() {
+  bin=$1
+  fields=$2
+  size=$3
+
+  cat |
+    csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+    csv-eval --binary=3d --fields=x,y,z "i=floor(z/$size)" --output-format=ui |
+    csv-calc min,max --binary=3d,ui --fields=x,y,,id |
+    csv-eval --binary=4d,ui --fields=min_x,min_y,max_x,max_y "xd=max_x-min_x;yd=max_y-min_y;vol=xd*yd*$size" -o=vol |
+    csv-calc sum --binary=4d,ui,d --fields=,,,,,vol | csv-from-bin d
+}
+
+function doCloud_bounds() {
+  bin=$1
+  fields=$2
+
+  cat |
+    csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+    csv-calc percentile=0.05,percentile=0.95 --binary=3d --fields=x,y,z | csv-from-bin 6d | tee tempbooooooo.bin |
+    # csv-calc min,max --binary=3d --fields=x,y,z | csv-from-bin 6d |
+    csv-eval --format=6d --fields=min_x,min_y,min_z,max_x,max_y,max_z "dx=(max_x-min_x);dy=(max_y-min_y);dz=(max_z-min_z)" |
+    csv-shuffle --fields=,,,,,,dx,dy,dz -o=dx,dy,dz |
+    csv-eval --format=3d --fields=dx,dy,dz "v=dx*dy*dz" | csv-shuffle --fields=,,,v -o=v 2>/dev/null
+}
+
+function doCloud_cylinders() {
+  bin=$1
+  fields=$2
+  size=$3
+
+  cat |
+    csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+    csv-eval --binary=3d --fields=x,y,z "i=floor(z/$size)" --output-format=ui |
+    # Filter out the bottom segment, since "canopy only"
+    csv-calc max --binary=3d,ui --append --fields=,,,i |
+    csv-eval --binary=3d,2ui --fields=,,,i,m "keep=where(i<m,1,0)" --output-format=ui |
+    csv-select --binary=3d,3ui --fields=x,y,z,i,m,k "k;equals=1" |
+    csv-shuffle -b=3d,3ui -f=x,y,z,i -o=x,y,z,i |
+    # Now compute cylinders
+    csv-calc percentile=0.05,percentile=0.95 --binary=3d,ui --fields=x,y,,id |
+    # csv-calc min,max --binary=3d,ui --fields=x,y,,id |
+    csv-eval --binary=4d,ui --fields=min_x,min_y,max_x,max_y "xd=max_x-min_x;yd=max_y-min_y;mxd=where(xd>yd,xd,yd)/2;vol=pi*mxd*mxd*$size" -o=vol |
+    csv-calc sum --binary=4d,ui,d --fields=,,,,,vol | csv-from-bin d
+}
+
+function doCloud_trapezoid() {
+  bin=$1
+  fields=$2
+  size=$3
+
+  cat |
+    csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+    csv-calc percentile=0.1,percentile=0.9,min,max --fields=,,z --binary=3d --append |
+    csv-calc percentile=0.05,percentile=0.95 --fields=,y --binary=3d,4d --append |
+    # csv-calc min,max --fields=,y --binary=3d,4d --append |
+    csv-eval --binary=3d,6d --fields=x,y,z,pt,pe,minZ,maxZ,minY,maxY "i=where(z<pt,1,where(z>pe,2,0));y=maxY-minY;z=maxZ-minZ" --output-format=ui |
+    # csv-eval --binary=3d,6d --fields=x,y,z,pt,pe,minZ,maxZ,minY,maxY "i=where(z<pt,1,where(z>pe,2,0))" --output-format=ui | tee temp2.bin |
+    csv-shuffle --binary=9d,ui --fields=x,y,z,pt,pe,minZ,maxZ,minY,maxY,i -o=x,y,z,pt,pe,i |
+    csv-calc mean,percentile=0.05,percentile=0.95 --binary=3d,2d,ui --fields=x,y,z,,,id |
+    # csv-calc mean,min,max --binary=3d,2d,ui --fields=x,y,z,,,id |
+    csv-eval --binary=3d,3d,3d,ui --fields=meanX,meanY,meanZ,minX,minY,minZ,maxX,maxY,maxZ,i "A=where(i>0,maxX-minX,0)" --output-format=d |
+    csv-shuffle --binary=3d,3d,3d,ui,d --fields=meanX,meanY,meanZ,minX,minY,minZ,maxX,maxY,maxZ,i,A -o=A,meanY,meanZ |
+    csv-from-bin 3d | csv-calc sum --format=3d --fields=A --append |
+    head -1 |
+    csv-eval --format=4d --fields=,L,H,aPlusB "vol=L*H*aPlusB/2" |
+    csv-shuffle -f=,,,,v -o=v
+}
+
+function doCloud_voxhull() {
+  bin=$1
+  fields=$2
+  size=$3
+
+  echo "SIZE: $size" >&2
+
+  r=0.02 # Resolution for points-to-partitions
+
+  cf=$(echo $fields | csv-fields clear)
+
+  cat |
+    points-to-voxel-indices --binary=$bin --fields=$fields --resolution=$size |
+    csv-sort --binary=$bin,3ui --fields=$cf,i,j,k |
+    csv-blocks group --binary=$bin,3ui --fields=$cf,id,id,id |
+    csv-shuffle --binary=$bin,3ui,ui --fields=$fields,i,j,k,b -o=$fields,b | tee voxhull.mid.indices.bin |
+    points-to-partitions --binary=$bin,ui --fields=$fields,block --resolution=$r --min-points-per-partition 3 |
+    csv-sort --binary=$bin,2ui --fields=$cf,a,b | csv-blocks group --binary=$bin,2ui --fields=$cf,id,id |
+    csv-shuffle --binary=$bin,3ui --fields=$fields,,,id -o=$fields,id | tee voxhull.mid.partitions.bin |
+    csv-from-bin $bin,ui | vol-conv-hull volume -a -f $fields,id # 2>/dev/null
+}
+
+function doCloud_voxels() {
+  bin=$1
+  fields=$2
+  size=$3
+  echo "AAAAH" >&2
+  cat |
+    points-to-voxels --binary=$bin --fields=$fields --resolution=$size |
+    csv-calc size --binary=3ui,3d,ui --fields=i | csv-cast -b=ui -o=d |
+    csv-eval --binary=d --fields=x "x = x * ($size**3)" | csv-from-bin d
+}
+
+function doCloud_slices() {
+  bin=$1
+  fields=$2
+  size=$3
+
+  cat |
+    csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+    csv-eval --binary=3d --fields=x,y,z "i=floor(z/$size)" --output-format=ui |
+    csv-from-bin 3d,ui |
+    vol-conv-hull volume -f=x,y,z,id 2>/dev/null
+}
+
+function doCloud_smartslices() {
+  bin=$1
+  fields=$2
+  size=$3
+  sizeP=0.1
+
+  TEMP=$(mktemp -d)
+  GOBACK=$(pwd)
+
+  cd $TEMP
+  cat |
+    csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+    csv-eval --binary=3d --fields=x,y,z "i=floor(z/$size)" --output-format=ui | csv-sort --binary=3d,ui --fields=x,y,z,a --order=a |
+    # csv-split --binary=3d,ui --fields=,,,id
+    # ls | while read f; do
+    # cat $f |
+    points-to-partitions --binary=3d,ui --fields=x,y,z,block --resolution=$sizeP |
+    # tee -a $GOBACK/temp.bin |
+    csv-sort --binary=3d,2ui --fields=,,,a,b --order=a,b |
+    csv-blocks group --binary=3d,2ui --fields=,,,id,id |
+    csv-shuffle --binary=3d,3ui --fields=x,y,z,a,b,i -o=x,y,z,i |
+    csv-from-bin 3d,ui |
+    vol-conv-hull volume -f=x,y,z,id #2>/dev/null
+  # done |
+  # csv-calc sum --format=d --fields=v
+
+  cd $GOBACK
+  rm -rf $TEMP
+}
+
+function doCloud_smartslices2() {
+  bin=$1
+  fields=$2
+  size=$3
+  sizeP=0.05
+
+  TEMP=$(mktemp -d)
+  GOBACK=$(pwd)
+
+  cd $TEMP
+  cat |
+    csv-shuffle --binary=$bin --fields=$fields -o=x,y,z |
+    csv-eval --binary=3d --fields=x,y,z "i=floor(z/$size)" --output-format=ui | tee $GOBACK/smartslices.levels.bin |
+    csv-split --binary=3d,ui --fields=,,,id
+  ls | while read f; do
+    cat $f | points-to-partitions --binary=3d,ui --fields=x,y,z --resolution=$sizeP
+  done |
+    csv-eval --binary=3d,2ui --fields=x,y,z,ia,ib "ia=ia*1000+ib" |
+    csv-shuffle -b=3d,2ui -f=x,y,z,i -o=x,y,z,i | tee $GOBACK/smartslices.partitions.bin |
+    tee $GOBACK/temp.bin |
+    csv-from-bin 3d,ui |
+    vol-conv-hull volume -f=x,y,z,id 2>/dev/null
+
+  cd $GOBACK
+  rm -rf $TEMP
+}
+
+function goPar() {
+  bin=$1
+  fields=$2
+  size=$3
+  method=$4
+  f=$5
+
+  echo -n "$(echo $f | cut -d. -f1),"
+  for m in $(echo $method | tr ',' '\n'); do echo -n $(cat $f | doCloud_$m $bin $fields $size),; done
+  echo ""
+
+}
+
+function go() {
+  bin=$1
+  fields=$2
+  size=$3
+  method=$4
+  cores=$5
+
+  if $(echo $fields | csv-fields has --fields=id); then
+    rm -rf temp
+    mkdir temp
+    cd temp
+
+    cat | remove-trunk --binary=$bin --fields=$fields | csv-split --binary=$bin --fields=$(echo $fields | csv-fields clear --except id)
+    set=$(ls | grep -v "^0\.bin")
+    [[ $zero ]] && set=$(ls)
+
+    export -f goPar
+    for m in $(echo $method | tr ',' '\n'); do export -f doCloud_$m; done
+
+    echo "$set" | parallel -n 1 -j $cores goPar $bin $fields $size $method {}
+    # for f in $set ;
+    # do
+    #   echo -n "$(echo $f | cut -d. -f1),"
+    #   for m in `echo $method | tr ',' '\n'` ; do echo -n $(cat $f | doCloud_$m $bin $fields $size),; done
+    #   echo "";
+    # done
+    cd ..
+  else
+    cat | remove-trunk --binary=$bin --fields=$fields |
+      doCloud_$method $bin $fields $size
+  fi
+}
+function go_simple() {
+  bin=$1
+  fields=$2
+  size=$3
+  method=$4
+  cores=$5
+
+  cat | doCloud_$method $bin $fields $size
+}
+
+function option-description() {
+  cat <<eof
+--binary=[<format>]; default="3d"; Binary format used in point clouds
+--fields=[<fields>]; default="x,y,z"; Point cloud fields, must include "x,y,z".  Can include "id".
+--size=[<size>]; default=0.2; Size to use for slicing or voxelising
+--cores=[<cores>]; default=8; Cores to use if "id" is included.
+--include-zero; If this flag is set, don't skip ID 0.
+--verbose, -v; Output progress to stderr
+--simple, -s; Don't try to remove the trunk
+eof
+}
+
+function usage() {
+  cat <<eof
+
+$name Computes the volume of a given point cloud from STDIN.
+
+usage: cat pointcloud | $name <operation> [options]
+
+<operation>:
+  bounds
+    Compute volume by bounding box
+  manual
+    Estimate manual volume measurement by stacked cylinders
+  slices
+    Compute volume by convex hull of vertical slices
+  smartslices
+    Compute volume by convex hull of vertical slices
+  voxels
+    Compute volume by sum of voxel volumes
+  voxhull
+    Compute volume by voxelised convex hull
+
+options:
+$(option-description | sed 's/^/    /g')
+
+eof
+  exit 1
+}
+
+if (($(comma_options_has --help $@) || $(comma_options_has -h $@))); then usage; fi
+options=$(option-description | comma-options-to-name-value "$@") || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<<"$options"
+eval "$(option-description | comma-options-to-name-value "$@" | comma_path_value_mangle)"
+
+(($(comma_options_has --verbose "$@"))) && export readonly verbose=true
+(($(comma_options_has --simple "$@"))) && export readonly simple=true
+(($(comma_options_has --include-zero "$@"))) && export readonly zero=true
+
+set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+if [[ $simple ]]; then
+  cat | go_simple $options_binary $options_fields $options_size $1 $options_cores
+
+else
+  cat | go $options_binary $options_fields $options_size $1 $options_cores
+fi

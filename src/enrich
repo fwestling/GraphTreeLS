@@ -1,0 +1,255 @@
+#!/bin/bash
+
+# "Enrich" a point cloud using voxel-based methods
+
+export readonly name=$( basename $0 )
+
+source $( type -p comma-application-util ) || (error "comma not installed")
+function errcho { (>&2 echo "$name: $1") }
+function error
+{
+    errcho "error: $1"
+    exit 1
+}
+
+
+function go() {
+  local bin=$1
+  local fields=$(echo $2 | csv-fields prefix --path="input" --except=x,y,z)
+  local vs=$3
+  local thresh=$4
+  local cores=$5
+
+  local jr=$(echo $vs | csv-eval --format=d --fields=x "x=x*3") # Must be at least 2*srqt(2) = 2.828
+
+  [[ $verbose ]] && echo "Starting" >&2
+
+  cf=$(echo $fields | csv-fields clear)
+  mf=$(echo $fields | csv-fields clear --except=x,y,z | csv-fields rename --fields=x,y,z --to=mx,my,mz)
+  xf=$(echo $fields | csv-fields clear --except=x,y,z)
+
+  ebin="$bin,5ui,$eigen_bin"
+  efields="$fields,voxI,voxJ,voxK,vid,w,$eigen_fields"
+  evec_fields="eA/x,eA/y,eA/z,eB/x,eB/y,eB/z,vx,vy,vz,valA,valB,valC"
+
+  cEigen=$(echo $eigen_fields | csv-fields clear)
+  cSf1=$(echo $sf1_fields | csv-fields clear)
+
+  cat | points-to-voxel-indices --binary=$bin --fields=$fields --resolution=$vs |
+    csv-sort --binary=$bin,3ui --fields=$cf,i,j,k |
+    csv-blocks group --binary=$bin,3ui --fields=$cf,id,id,id |
+    tee $VOXI | csv-calc mean,size --binary=$bin,4ui --fields=$fields,voxI,voxJ,voxK,id |
+    csv-shuffle -b=$bin,3ui,$(echo $bin | sed 's/d/ui/g'),3ui,ui -f=$fields,voxI,voxJ,voxK,$(echo $fields | csv-fields prefix --path count),,,,id -o=$fields,voxI,voxJ,voxK,id,count/x |
+    csv-select --binary=$bin,5ui --fields=$cf,,,,,c "c;ge=$thresh" > $VOXM
+
+  [[ $verbose ]] && echo "VOXM done" >&2
+
+  cat $VOXM | points-eigen "$VOXI;binary=$bin,4ui;fields=$fields,voxI,voxJ,voxK,id" --binary=$bin,5ui --fields=$fields,vI,vJ,vK,id,w --normalize --radius=0.4 2>/dev/null > $EIGEN
+
+  [[ $verbose ]] && echo "EIGEN done" >&2
+  # TODO:
+  # Convert voxI,voxJ and voxK into 26-con, vertical-con and horizontal-con
+  cat $VOXM | points-join --binary=$bin,5ui --fields=$xf "$VOXM;binary=$bin,5ui;fields=$xf" --radius=$jr --all 2>/dev/null | tee temp2.bin |
+    csv-shuffle -b=$bin,5ui,$bin,5ui -f=$fields,vIA,vJA,vKA,id,cx,$cf,vIB,vJB,vKB -o=$fields,id,cx,vIA,vJA,vKA,vIB,vJB,vKB |
+    csv-eval --binary=$bin,2ui,6ui --fields=$cf,,,ai,aj,ak,bi,bj,bk "di=abs(ai-bi);dj=abs(aj-bj);dk=abs(ak-bk)" --output-format=3ui |
+    csv-select --binary=$bin,2ui,9ui --fields=$cf,,,,,,,,,i,j,k "i;less=2" "j;less=2" "k;less=2" | tee temp.bin |
+    csv-eval --binary=$bin,2ui,9ui --fields=$cf,,,,,,,,,i,j,k "con=1;vert=k;horz=where(i+j>0,where(k==0,1,0),0)" --output-format=3ui |
+    csv-calc mean,sum --binary=$bin,2ui,12ui --fields=$fields,id,cx,,,,,,,,,,con,vert,horz |
+    csv-shuffle -b=$bin,4ui,$bin,4ui,ui -f=$fields,cx,,,,$cf,,i,j,k,id -o=$fields,i,j,k,id,cx |
+
+  # cat $VOXM |
+    csv-join --binary=$bin,5ui --fields=$cf,,,,id "$EIGEN;binary=$eigen_bin,ui;fields=$eigen_fields,id" |
+    csv-shuffle -b=$bin,5ui,$eigen_bin,ui -f=$fields,voxI,voxJ,voxK,id,w,$eigen_fields -o=$fields,voxI,voxJ,voxK,id,w,$eigen_fields |
+    csv-select --binary=$bin,5ui,$eigen_bin --fields=$cf,,,,,w,$eigen_fields "vA;greater=0" "vB;greater=0" "vC;greater=0" |
+    # csv-from-bin $bin,2ui,$eigen_bin | head -1
+
+  # Current state of point cloud:
+  ## One point per voxel (average location of voxel), with format:
+  ## 1. original fields
+  ## 2. Unique voxel id
+  ## 3. Number of points in voxel
+  ## 4. Eigen vector A (x,y,z)
+  ## 5. Eigen vector B (x,y,z)
+  ## 6. Eigen vector C (x,y,z)
+  ## 7. Eigen values (a,b,c), sorted in decreasing order
+
+  # Definitions here can be found in Poux's article from 2019 (TODO Add details)
+
+  ## SF1 Eigen:
+  csv-eval --binary=$ebin --fields=$cf,,,,,,$(echo $eigen_fields | csv-fields clear --except=vA,vB,vC) \
+      "vA=where(vA<0,0,vA);vB=where(vB<0,0,vB);vC=where(vC<0,0,vC);\
+      la=(vA-vC)/vA;\
+      ll=(vA-vB)/vA;\
+      lp=(vB-vC)/vA;\
+      lv=vC/(vA+vB+vC);\
+      lo=(where(vA*vB*vC,vA*vB*vC,0))**(1./3);\
+      ls=vC/vA;\
+      le=-(where(vA<=0,0,vA*log(vA))+where(vB<=0,0,vB*log(vB))+where(vC<=0,0,vC*log(vC)))" --output-format $sf1_bin |
+  ### Join back to VOXI to get all the points for geometrics.
+  csv-join --binary=$ebin,$sf1_bin --fields=$cf,,,,id "$VOXI;binary=$bin,4ui;fields=$cf,,,,id" |
+    csv-shuffle -b=$ebin,$sf1_bin,$bin,4ui --fields=$mf,voxI,voxJ,voxK,i,w,$eigen_fields,$sf1_fields,$fields -o=$fields,voxI,voxJ,voxK,i,$eigen_fields,$sf1_fields,w,mx,my,mz |
+
+    if [[ $verbose ]]
+    then
+      echo "Eigen and csv-join done" >&2
+      cat
+    else
+      cat
+    fi |
+
+  ## SF1 Geometry:
+    csv-calc var --binary=$bin,4ui,$eigen_bin,$sf1_bin,ui,3d --fields=$xf,,,,id --append |
+    csv-from-bin $bin,4ui,$eigen_bin,$sf1_bin,ui,6d |
+    # Area along vC (use evec_fields to compute area along vector)
+    ~/src/tree-crops/phenotyping-lidar/volume/vol-conv-hull area --fields=$fields,voxI,voxJ,voxK,id,$evec_fields,$sf1_fields,num_pts,meanX,meanY,meanZ,varX,varY,varZ --append |
+    if [[ $verbose ]]
+    then
+      echo "Area V done" >&2
+      cat
+    else
+      cat
+    fi |
+    # Area along z axis
+    ~/src/tree-crops/phenotyping-lidar/volume/vol-conv-hull area --fields=$fields,voxI,voxJ,voxK,id,$eigen_fields,$sf1_fields,num_pts,meanX,meanY,meanZ,varX,varY,varZ,areaV --append |
+    if [[ $verbose ]]
+    then
+      echo "Area Z done" >&2
+      cat
+    else
+      cat
+    fi |
+    # Volume
+    ~/src/tree-crops/phenotyping-lidar/volume/vol-conv-hull volume --fields=$fields,voxI,voxJ,voxK,id,$eigen_fields,$sf1_fields,num_pts,meanX,meanY,meanZ,varX,varY,varZ,areaV,areaZ --append |
+
+    if [[ $verbose ]]
+    then
+      echo "Volume done" >&2
+      cat
+    else
+      cat
+    fi |
+    # Densities
+    csv-to-bin $(echo $bin,4ui,$eigen_bin,$sf1_bin,ui,6d,3d | sed -r 's/[a-z]+/d/g') | # Some bullshit I have to do because python
+    csv-from-bin $(echo $bin,4ui,$eigen_bin,$sf1_bin,ui,6d,3d | sed -r 's/[a-z]+/d/g') |
+    csv-to-bin $bin,4ui,$eigen_bin,$sf1_bin,ui,6d,3d |
+    csv-eval --binary=$bin,4ui,$eigen_bin,$sf1_bin,ui,6d,3d --fields=$fields,voxI,voxJ,voxK,id,$cEigen,$cSf1,num_pts,meanX,meanY,meanZ,varX,varY,varZ,areaV,areaZ,volume "densityA=where(volume==0,0,num_pts/volume);densityB=volume/($vs*$vs*$vs)" --output-format=2d 2>/dev/null # I have to hide the runtime warning - the "where" expression avoids invalid values, but eval still computes them.
+
+  # Should I normalise all the things?  Super annoying in terms of fields though...
+  # I'll make this easier by creating a new script to normalise fields
+
+  # I should NOT normalise - one hyper-dense voxel in one point cloud would lower the density for all other voxels in only that point cloud.
+}
+
+function option-description
+{
+    cat <<eof
+--binary=[<format>]; default=3d; Binary format used in point cloud
+--fields=[<fields>]; default=x,y,z; Point cloud fields, must include "x,y,z"
+--voxel-threshold=[<count>]; default=1; Voxels with fewer than this number of points are discarded (noise removal)
+--voxel-size=[<size>]; default=0.1; voxel size to use to speed up computation.
+--cores=[<cores>]; default=4; Number of cores to use when parallelising.
+--verbose, -v; Output progress to stderr
+--output-fields; Don't process, just list the output fields
+--output-format; Don't process, just list the output format
+--normalize; Output all metrics as a value from 0 to 1
+eof
+}
+
+
+function usage
+{
+    cat <<eof
+
+$name Augments a point cloud with rich feature descriptors described by Poux (2019)
+Outputs to stdout, input data plus added features.
+
+usage: cat <point_cloud> | $name [options]
+
+options: $( option-description  | sed 's/^/    /g' )
+
+example usage:
+  cat xyz.bin | $name > rich.bin
+
+eof
+    exit 1
+}
+
+if (( $( comma_options_has --help $@ ) || $( comma_options_has -h $@ ) )) ; then usage ; fi
+options=$( option-description | comma-options-to-name-value "$@" ) || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<< "$options"
+eval "$( option-description | comma-options-to-name-value "$@" | comma_path_value_mangle )"
+
+# set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+export readonly TEMPDIR=$(mktemp -d)
+[[ $verbose ]] && echo "Temp dir: $TEMPDIR" >&2
+export readonly VOXI=$TEMPDIR/voxi.bin
+export readonly VOXM=$TEMPDIR/voxall.bin
+export readonly EIGEN=$TEMPDIR/eigen.bin
+
+export readonly eigen_bin="12d"
+export readonly eigen_fields="eA/x,eA/y,eA/z,eB/x,eB/y,eB/z,eC/x,eC/y,eC/z,vA,vB,vC"
+
+export readonly sf1_bin="7d"
+export readonly sf1_fields="eigen/la,eigen/ll,eigen/lp,eigen/lv,eigen/lo,eigen/ls,eigen/le"
+
+
+function cleanup() {
+  rm -rf $TEMPDIR
+  exit
+}
+
+trap cleanup EXIT
+trap cleanup INT
+
+(( $( comma_options_has --verbose "$@" ) )) && export readonly verbose=true
+(( $( comma_options_has --output-fields "$@" ) )) && export readonly OUTFI=true
+(( $( comma_options_has --output-format "$@" ) )) && export readonly OUTFO=true
+(( $( comma_options_has --normalize "$@" ) )) && export readonly NORMALIZE=true
+
+if [[ $OUTFI ]]
+then
+  echo -n "Output fields: " >&2
+  echo "$(echo $fields | csv-fields prefix --path=input --except=x,y,z),voxConn,voxConnV,voxConnH,vox_id,$eigen_fields,$sf1_fields,num_pts,meanX,meanY,meanZ,varX,varY,varZ,areaV,areaZ,volume,densA,densB"
+elif [[ $OUTFO ]]
+then
+  echo -n "Output format: " >&2
+  if [[ $NORMALIZE ]]
+  then
+    echo "$binary,3d,ui,$eigen_bin,$sf1_bin,d,3d,3d,3d,2d" | csv-format collapse
+  else
+    echo "$binary,4ui,$eigen_bin,$sf1_bin,ui,3d,3d,3d,2d" | csv-format collapse
+  fi
+else
+  if [[ $NORMALIZE ]]
+  then
+    normFields=$(echo $fields | csv-fields clear),,,,,$(echo $eigen_fields | csv-fields clear),$sf1_fields,num_pts,meanX,meanY,meanZ,varX,varY,varZ,areaV,areaZ,volume,densA,densB
+    [[ $verbose ]] && echo "NORMALISED FIELDS: $fields,voxConn,voxConnV,voxConnH,vox_id,$eigen_fields,$sf1_fields,num_pts,meanX,meanY,meanZ,varX,varY,varZ,areaV,areaZ,volume,densA,densB" >&2
+    go $options_binary $options_fields $options_voxel_size $options_cores | tee temp_prenorm.bin |
+      csv-cast $binary,4ui,$eigen_bin,$sf1_bin,ui,3d,3d,3d,2d $binary,3d,ui,$eigen_bin,$sf1_bin,ui,3d,3d,3d,2d --force |
+      csv-eval --binary=$binary,3d,ui,$eigen_bin,$sf1_bin,ui,3d,3d,3d,2d --fields=$fields,con,vert,horz "con=con/26.0;vert=vert/18.0;horz=horz/9.0" |
+      if [[ $verbose ]]
+      then
+        echo "Normalising fields..." >&2
+        echo "Binary: $binary,3d,ui,$eigen_bin,$sf1_bin,ui,3d,3d,3d,2d" >&2
+        echo "Fields: $normFields" >&2
+        cat
+      else
+        cat
+      fi |
+      ~/src/tree-crops/phenotyping-lidar/normalise-fields \
+        --binary=$binary,3d,ui,$eigen_bin,$sf1_bin,ui,3d,3d,3d,2d \
+        --fields=$normFields
+  else
+    go $options_binary $options_fields $options_voxel_size $options_voxel_threshold $options_cores
+  fi
+fi
+
+
+# Testing:
+# cd /mnt/data/miniset/real
+# for f in *bin ; do echo $f >&2; cat $f | ~/src/tree-crops/phenotyping-lidar/enrich --binary=3d,3ui --fields=x,y,z,cl,seg,bId > enriched/$f ; done
+# cd /mnt/data/training/aligned
+# for f in */*bin ; do echo $f >&2; cat $f | ~/src/tree-crops/phenotyping-lidar/enrich --binary=3d,2ui,d --fields=x,y,z,cl,seg,h > ../enriched/$f ; done
+
+# cd /mnt/data/miniset/real ; for f in *bin ; do echo $f >&2; cat $f | ~/src/tree-crops/phenotyping-lidar/enrich --binary=3d,3ui --fields=x,y,z,cl,seg,bId > enriched/$f ; done ; cd /mnt/data/training/aligned ; for f in */*bin ; do echo $f >&2; cat $f | ~/src/tree-crops/phenotyping-lidar/enrich --binary=3d,2ui,d --fields=x,y,z,cl,seg,h > ../enriched/$f ; done

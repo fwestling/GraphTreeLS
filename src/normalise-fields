@@ -1,0 +1,111 @@
+#!/bin/bash
+
+# Normalise all given fields using the min-max method
+
+export readonly name=$( basename $0 )
+
+source $( type -p comma-application-util ) || (error "comma not installed")
+function errcho { (>&2 echo "$name: $1") }
+function error
+{
+    errcho "error: $1"
+    exit 1
+}
+
+
+function go() {
+  local bin=$1
+  local fields=$(echo $2 | csv-fields prefix --path=in | sed 's/\//__/g')
+  local cores=$3
+
+  [[ $verbose ]] && echo "bin:" >&2
+  [[ $verbose ]] && echo "$bin" >&2
+  [[ $verbose ]] && echo "fields:" >&2
+  [[ $verbose ]] && echo "$fields" >&2
+
+
+  local nonames=$(echo $fields | sed -r 's/,+/,/g' | sed -r 's/^,+//' | sed -r 's/,+$//')
+  local mins=$(echo $nonames | csv-fields prefix --path=min | sed -r 's/min\//min_/g')
+  local maxs=$(echo $nonames | csv-fields prefix --path=max | sed -r 's/max\//max_/g')
+
+
+  [[ $verbose ]] && echo "mins fields:" >&2
+  [[ $verbose ]] && echo $nonames,$mins,$maxs >&2 #,$mins,$maxs >&2
+
+  forced_bin=$(echo $bin | csv-format expand | csv-fields clear --unmask=$fields | 
+    perl -ne 's/,(?=,)/,d/g; print;' | sed 's/^,/d,/' | sed 's/,$/,d/' | sed 's/^$/d/' | csv-format collapse)
+  [[ $verbose ]] && echo "forced:" >&2
+  [[ $verbose ]] && echo $forced_bin >&2
+
+  # masked_bin=$(echo $mins | perl -ne "s/,[^,]+(?=,c)/,d/g;print;" | 
+  #   sed -r 's/^[^,]+,/d,/' | sed -r 's/,[^,]+$/,d/' | sed -r 's/^[^,]+$/d/' | csv-format collapse)
+
+  masked_bin=$(echo $mins | sed -r 's/[a-zA-Z_]+/d/g' | csv-format collapse)
+  [[ $verbose ]] && echo "masked:" >&2
+  [[ $verbose ]] && echo $masked_bin >&2
+
+  exp=$(echo $nonames | sed -r 's/([^,]+)/\1=(\1-min_\1)\/(max_\1-min_\1)/g' | tr ',' ';')
+
+  cat | csv-cast $bin $forced_bin --force | csv-calc min,max --binary=$forced_bin --fields=$fields --append | 
+    csv-eval --binary=$forced_bin,$masked_bin,$masked_bin --fields=$fields,$mins,$maxs "$exp" |
+    csv-shuffle -b=$forced_bin,$masked_bin,$masked_bin -f=$fields -o=$fields
+
+}
+
+function option-description
+{
+    cat <<eof
+--binary=[<format>]; default=d; Binary format used in point cloud
+--fields=[<fields>]; default=x; Point cloud fields; all named fields are normalised
+--cores=[<cores>]; default=4; Number of cores to use when parallelising.
+--verbose, -v; Output progress to stderr
+eof
+}
+
+
+function usage
+{
+    cat <<eof
+
+$name Normalises named fields using the min/max method
+Outputs the same fields as input, but scaled to [0,1]; note all named fields will be cast to "d" format
+
+usage: cat <data> | $name [options]
+
+options: $( option-description  | sed 's/^/    /g' )
+
+example usage:
+  cat xyz.bin | $name > rich.bin
+
+eof
+    exit 1
+}
+
+if (( $( comma_options_has --help $@ ) || $( comma_options_has -h $@ ) )) ; then usage ; fi
+options=$( option-description | comma-options-to-name-value "$@" ) || error "invalid command line options"
+comma_path_value_to_var --prefix="options" <<< "$options"
+eval "$( option-description | comma-options-to-name-value "$@" | comma_path_value_mangle )"
+
+# set -e # Kill if anything errors out; we don't want it to run everything on bad datasets
+
+function cleanup() {
+  rm -rf $TEMPDIR
+  exit
+}
+
+trap cleanup EXIT
+trap cleanup INT
+
+(( $( comma_options_has --verbose "$@" ) )) && export readonly verbose=true
+
+go $options_binary $options_fields $options_cores 
+
+
+# Testing:
+# cd /mnt/data/miniset/real
+# for f in *bin ; do echo $f >&2; cat $f | ~/src/tree-crops/phenotyping-lidar/enrich --binary=3d,3ui --fields=x,y,z,cl,seg,bId > enriched/$f ; done
+# cd /mnt/data/training/aligned
+# for f in */*bin ; do echo $f >&2; cat $f | ~/src/tree-crops/phenotyping-lidar/enrich --binary=3d,2ui,d --fields=x,y,z,cl,seg,h > ../enriched/$f ; done
+
+# cd /mnt/data/miniset/real ; for f in *bin ; do echo $f >&2; cat $f | ~/src/tree-crops/phenotyping-lidar/enrich --binary=3d,3ui --fields=x,y,z,cl,seg,bId > enriched/$f ; done ; cd /mnt/data/training/aligned ; for f in */*bin ; do echo $f >&2; cat $f | ~/src/tree-crops/phenotyping-lidar/enrich --binary=3d,2ui,d --fields=x,y,z,cl,seg,h > ../enriched/$f ; done
+
